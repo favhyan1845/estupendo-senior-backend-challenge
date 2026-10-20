@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 
-from app.core.config import Settings
 from app.services.metrics import Metrics
 from app.services.producer import DurableBatchProducer
 from app.services.queue import InMemoryDocumentQueue

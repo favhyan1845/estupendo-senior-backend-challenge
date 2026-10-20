@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import redis.asyncio as redis
 
@@ -105,7 +106,11 @@ async def build_runtime(settings: Settings) -> Runtime:
         redis_client,
         stream=settings.dlq_stream,
         max_length=settings.dlq_max_length,
-        fallback_path=settings.spool_path.replace(".jsonl", "-dead-letter.jsonl"),
+        fallback_path=str(
+            Path(settings.spool_path).with_name(
+                Path(settings.spool_path).stem + "-dead-letter.jsonl"
+            )
+        ),
     )
 
     producer = DurableBatchProducer(

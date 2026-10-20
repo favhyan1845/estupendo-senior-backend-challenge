@@ -44,9 +44,13 @@ final class ProcessInvoiceBatchJob implements ShouldQueue
 
     public function handle(InvoiceProcessingService $service): void
     {
+        $batchSize = $this->maxRows > 0
+            ? min($this->batchSize, $this->maxRows)
+            : $this->batchSize;
+
         $outcome = $service->processBatch(
             afterId: $this->afterId,
-            batchSize: $this->batchSize,
+            batchSize: $batchSize,
             eventMode: $this->eventMode,
             batchNumber: $this->batchNumber,
         );
