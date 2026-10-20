@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     # Redis / streams
     redis_url: str = "redis://127.0.0.1:6379/0"
     redis_enabled: bool = True
+    redis_connect_timeout_seconds: float = Field(default=0.5, gt=0)
+    redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     queue_stream: str = "documents:inbox"
     consumer_group: str = "document-workers"
     queue_max_length: int = 500_000
@@ -63,7 +65,8 @@ class Settings(BaseSettings):
     # Durable fallback when Redis is unavailable / full
     spool_path: str = "/data/spool/documents-pending.jsonl"
     spool_flush_interval_seconds: float = Field(default=2.0, gt=0)
-    spool_publish_timeout_ms: int = 100
+    spool_publish_timeout_ms: int = Field(default=2000, gt=0)
+    document_dedup_ttl_seconds: int = Field(default=86_400, gt=0)
 
     @property
     def publish_timeout_seconds(self) -> float:

@@ -8,7 +8,7 @@ import time
 from fastapi import APIRouter, HTTPException, Response, status
 
 from app.api.deps import RuntimeDep, SettingsDep
-from app.schemas.documents import BatchAccepted, DocumentBatchRequest, ServiceStats
+from app.schemas.documents import BatchAccepted, BreakerSnapshot, DocumentBatchRequest, ServiceStats
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,8 @@ async def process_documents(
 
     started = time.perf_counter()
 
-    # The only awaited work on the request path: one pipelined write (or one
-    # fsync'd spool append). Validation happens in the worker.
+    # The only awaited work on the request path: one XADD (or one fsync'd
+    # spool append). Validation happens in the worker.
     receipt = await runtime.producer.publish(payload.documents, payload.batch_id)
 
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -69,6 +69,13 @@ async def process_documents(
 @router.get("/stats", response_model=ServiceStats, summary="Runtime metrics, queue depth and breaker state")
 async def stats(runtime: RuntimeDep) -> ServiceStats:
     breaker = await runtime.breaker.snapshot()
+    shared_breaker = await runtime.shared_metrics.breaker_snapshot()
+
+    if shared_breaker:
+        try:
+            breaker = BreakerSnapshot.model_validate(shared_breaker)
+        except ValueError:
+            pass
 
     try:
         queue_depth = await runtime.queue.depth()
@@ -81,16 +88,18 @@ async def stats(runtime: RuntimeDep) -> ServiceStats:
         dlq_depth = None
 
     metrics = runtime.metrics
+    shared = await runtime.shared_metrics.snapshot()
 
     return ServiceStats(
         accepted_batches=metrics.accepted_batches,
         accepted_documents=metrics.accepted_documents,
         published_to_broker=metrics.published_to_broker,
         published_to_spool=metrics.published_to_spool,
-        validated_documents=metrics.validated_documents,
-        rejected_documents=metrics.rejected_documents,
-        dead_lettered_documents=metrics.dead_lettered_documents,
-        processed_documents=metrics.processed_documents,
+        validated_documents=shared.get("validated", metrics.validated_documents),
+        rejected_documents=shared.get("rejected", metrics.rejected_documents),
+        duplicate_documents=shared.get("duplicates", metrics.duplicate_documents),
+        dead_lettered_documents=shared.get("dead_lettered", metrics.dead_lettered_documents),
+        processed_documents=shared.get("processed", metrics.processed_documents),
         spool_pending_batches=await runtime.spool.pending_batches(),
         dlq_depth=dlq_depth,
         queue_depth=queue_depth,

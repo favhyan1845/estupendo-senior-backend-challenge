@@ -33,7 +33,7 @@ async def test_accepts_1000_documents_in_under_200_milliseconds(client, runtime)
     assert response.headers["X-Queue-Channel"] == "memory"
     assert elapsed_ms < 200, f"Endpoint took {elapsed_ms:.1f} ms"
 
-    assert await runtime.queue.depth() == 1000
+    assert await runtime.queue.depth() == 1, "one stream entry per batch"
 
 
 @pytest.mark.asyncio
@@ -87,7 +87,7 @@ async def test_stats_expose_breaker_state_and_queue_depth(client) -> None:
     assert body["accepted_batches"] == 1
     assert body["accepted_documents"] == 3
     assert body["published_to_broker"] == 3
-    assert body["queue_depth"] == 3
+    assert body["queue_depth"] == 1, "queue depth counts batches, not documents"
     assert body["circuit_breaker"]["state"] == "closed"
     assert body["circuit_breaker"]["failure_threshold"] == 5
 

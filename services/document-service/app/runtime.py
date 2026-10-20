@@ -19,6 +19,7 @@ from app.services.queue import DocumentQueue, InMemoryDocumentQueue, RedisDocume
 from app.services.replayer import SpoolReplayer
 from app.services.resilient_validator import ResilientValidator
 from app.services.retry import RetryPolicy
+from app.services.shared_metrics import SharedMetrics
 from app.services.spool import DiskSpool
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class Runtime:
     validator: ResilientValidator
     processor: DocumentProcessor
     external_client: ExternalValidationClient
+    shared_metrics: SharedMetrics
     redis_client: redis.Redis | None = None
 
     async def close(self) -> None:
@@ -54,8 +56,8 @@ async def build_runtime(settings: Settings) -> Runtime:
         redis_client = redis.Redis.from_url(
             settings.redis_url,
             decode_responses=True,
-            socket_connect_timeout=0.3,
-            socket_timeout=0.5,
+            socket_connect_timeout=settings.redis_connect_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
             health_check_interval=30,
         )
         queue = RedisDocumentQueue(
@@ -97,6 +99,10 @@ async def build_runtime(settings: Settings) -> Runtime:
     )
 
     metrics = Metrics()
+    shared_metrics = SharedMetrics(
+        redis_client,
+        dedup_ttl_seconds=settings.document_dedup_ttl_seconds,
+    )
 
     validator = ResilientValidator(external_client, breaker, retry_policy)
 
@@ -134,6 +140,7 @@ async def build_runtime(settings: Settings) -> Runtime:
         queue=queue,
         dlq=dlq,
         metrics=metrics,
+        shared_metrics=shared_metrics,
         max_inflight=settings.worker_max_inflight,
         max_attempts=settings.retry_max_attempts,
     )
@@ -150,5 +157,6 @@ async def build_runtime(settings: Settings) -> Runtime:
         validator=validator,
         processor=processor,
         external_client=external_client,
+        shared_metrics=shared_metrics,
         redis_client=redis_client,
     )

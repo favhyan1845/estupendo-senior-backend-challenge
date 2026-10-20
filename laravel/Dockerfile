@@ -65,7 +65,7 @@ USER www-data
 EXPOSE 8000
 
 ENTRYPOINT ["entrypoint"]
-CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000"]
+CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000", "--no-reload"]
 
 # ---------------------------------------------------------------------------
 # Testing image: same runtime + dev dependencies
@@ -74,4 +74,20 @@ FROM runtime AS testing
 
 USER root
 COPY --from=vendor-dev /app/vendor /var/www/html/vendor
+
+# The runtime image was built with --no-dev, so its package manifest does not
+# know about PHPUnit/Collision. Regenerate it with the dev vendor in place.
+RUN php artisan package:discover --ansi \
+    && chown -R www-data:www-data bootstrap/cache
+
+# phpdotenv tries to read .env on every boot; a missing file surfaces as a
+# PHPUnit warning (suppressed warning converted by PHPUnit 11). A committed
+# .env.testing keeps the test image self-contained and deterministic.
+RUN printf '%s\n' \
+        'APP_ENV=testing' \
+        'APP_KEY=base64:1b2ZTO+Y/bjmwzSjsz1ffQHnYwjRR398knldvmJjdms=' \
+        'LOG_CHANNEL=stderr' \
+        > /var/www/html/.env.testing \
+    && chown www-data:www-data /var/www/html/.env.testing
+
 USER www-data

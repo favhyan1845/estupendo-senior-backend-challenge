@@ -61,6 +61,7 @@ class ServiceStats(BaseModel):
     published_to_spool: int
     validated_documents: int
     rejected_documents: int
+    duplicate_documents: int
     dead_lettered_documents: int
     processed_documents: int
     spool_pending_batches: int

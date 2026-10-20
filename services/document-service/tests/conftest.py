@@ -17,6 +17,7 @@ from app.services.metrics import Metrics
 from app.services.producer import DurableBatchProducer
 from app.services.queue import InMemoryDocumentQueue
 from app.services.replayer import SpoolReplayer
+from app.services.shared_metrics import SharedMetrics
 from app.services.spool import DiskSpool
 
 
@@ -97,6 +98,7 @@ def build_runtime(
         validator=validator or StubValidator(),
         processor=processor or StubProcessor(),
         external_client=StubExternalClient(),
+        shared_metrics=SharedMetrics(None),
     )
 
 

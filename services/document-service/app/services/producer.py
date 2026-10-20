@@ -1,8 +1,9 @@
 """Durable batch producer used by ``POST /documents/process``.
 
-Happy path: one MULTI/EXEC pipeline to Redis Streams, bounded by a short
-timeout (~150 ms). The endpoint must answer in <200 ms, so the producer never
-waits for the downstream validation - it only guarantees the batch was
+Happy path: a single XADD with the whole batch, bounded by a short timeout
+(~150 ms). The endpoint must answer in <200 ms, so the producer never waits for
+the downstream validation - it only guarantees the batch was *accepted
+durably*.
 *accepted durably*.
 
 Degraded path: if Redis is down/full/slow, the batch is appended to the disk

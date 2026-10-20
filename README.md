@@ -4,7 +4,7 @@
 
 Módulo Laravel para procesar **100.000 facturas** con un pico de memoria PHP **< 32 MB** y microservicio **FastAPI** asíncrono con reintentos, circuit breaker, DLQ y spool durable en disco. Todo el stack se levanta con `docker-compose` (Laravel, FastAPI, MySQL y Redis) e incluye el análisis de una arquitectura AWS de alta disponibilidad.
 
-> **Estado:** implementación completa y validada con ejecuciones reales (PHP 8.3.32 + MariaDB 10.6 + Python 3.10). Los números de rendimiento y memoria de este README son medidos, no estimados.
+> **Estado:** implementación completa y validada con ejecuciones reales en dos entornos: nativo (PHP 8.3.32 + MariaDB 10.6 + Python 3.10) y **Docker 29.9.1 / Compose v5.6.0** con MySQL 8.0, Redis 7, PHP 8.3 y Python 3.12. Los números de rendimiento y memoria de este README son medidos, no estimados.
 
 ## Índice
 
@@ -30,7 +30,7 @@ Módulo Laravel para procesar **100.000 facturas** con un pico de memoria PHP **
 | Actualizar 100k filas | **Un `UPDATE ... CASE id WHEN ...` por lote** (~500 filas) | 200 round-trips en vez de 100k, sin 100k locks fila a fila ni 100k sentencias en el undo log. |
 | Evento por factura | Evento de dominio por lote (`InvoiceBatchProcessed`) **por defecto**; `--events=per_invoice` disponible | Un evento por fila multiplica el coste; el modo literal queda implementado y medido. |
 | `DB::transaction` única | Modo `chunked` (transacción corta por lote) por defecto; `--transaction=single` implementado | Una transacción de 100k filas mantiene locks, undo log y snapshot durante toda la corrida. Análisis y evidencia en la [respuesta 4](#4-criterio-de-arquitectura-análisis-crítico). |
-| 202 en < 200 ms | Validación pydantic + **un pipeline MULTI/EXEC a Redis Streams** (o un append+fsync al spool) | La request no espera validación externa: solo deja el lote durable. Medido: **~7 ms** de procesamiento en servidor para 1.000 documentos. |
+| 202 en < 200 ms | Validación pydantic + **un único `XADD` con el lote completo** (o un append+fsync al spool) | La request no espera validación externa: solo deja el lote durable. Medido en Docker: **8,17 ms de servidor** para 1.000 documentos (43 ms round-trip). |
 | 30% de fallos del proveedor | Reintentos exponenciales con jitter + circuit breaker 5 fallos/30 s + DLQ | Aísla fallos transitorios, deja de martillar al proveedor caído y no pierde documentos. |
 | Broker caído o lleno | **Spool JSONL en disco con `fsync`** + replayer en background | El API sigue respondiendo 202 con el lote ya durable; Redis `noeviction` evita que se evacuen silenciosamente mensajes de la cola. |
 
@@ -66,7 +66,7 @@ Módulo Laravel para procesar **100.000 facturas** con un pico de memoria PHP **
     │   ├── schemas/              # contratos pydantic
     │   ├── services/             # producer, queue, spool, dlq, retry, breaker, validator, processor
     │   └── workers/              # consumer (streams) y mock externo (30% fallos)
-    ├── tests/                    # 30 tests pytest
+    ├── tests/                    # 40 tests pytest
     ├── scripts/bench_endpoint.py
     └── Dockerfile
 ```
@@ -220,6 +220,19 @@ composer bench:invoices
 | `--events=per_invoice` | 1 por lote | 100.000 | 15,31 s | 6.532 facturas/s | 25,71 MB | 28 MB |
 | `--transaction=single` | 1 global | 1 por lote | 13,58 s | 7.363 facturas/s | 25,72 MB | 28 MB |
 
+**Ejecución dentro de Docker** (`docker compose exec laravel php -d memory_limit=32M artisan invoices:process --json`), 100.000 filas, MySQL 8 en contenedor:
+
+| Métrica | Valor |
+|---|---|
+| Facturas procesadas | 100.000 (200 lotes) |
+| Tiempo | 15,48 s (cálido) / 30,3 s (bajo contención de I/O) |
+| Throughput | 3.300 – 6.462 facturas/s |
+| Pico PHP lógico | **6,13 MB** |
+| Pico allocator | **8 MB** |
+| Límite | 33.554.432 bytes (32 MB) |
+
+La diferencia con la ejecución nativa se explica por el `php.ini` de la imagen (opcache CLI activo) y por la contención de disco del volumen MySQL en el host; el pico de memoria es aún menor porque el framework arranca con una configuración más ligera.
+
 Lecturas:
 
 - El pico se mantiene **plano** al pasar de 5.000 a 100.000 filas: 25,71 MB en ambos casos. Es la prueba de que la memoria es O(lote) y no O(total).
@@ -279,10 +292,10 @@ Cabeceras: `X-Batch-Id`, `X-Processing-Time-Ms`, `X-Queue-Channel` (`redis`, `sp
 El único trabajo en la request es:
 
 1. validar el payload con pydantic (1.000 objetos pequeños);
-2. `XADD` de cada documento en **un solo pipeline MULTI/EXEC** (1 round-trip, timeout 150 ms);
+2. un **único `XADD` con el lote completo** (1 entrada de stream, timeout 150 ms);
 3. si Redis falla o excede el timeout, `append + fsync` al spool y **202 igualmente**.
 
-No hay validación externa, ni espera del worker, ni llamadas síncronas. La validación ocurre en `documents-worker`, que consume el stream con consumer groups.
+No hay validación externa, ni espera del worker, ni llamadas síncronas. La validación ocurre en `documents-worker`, que consume el stream con consumer groups. Agrupar el lote en una entrada (en vez de 1.000 `XADD`) mantiene la latencia estable incluso cuando los workers están saturando Redis: medido **8,17 ms de servidor** para 1.000 documentos.
 
 ### Resiliencia implementada
 
@@ -293,24 +306,26 @@ No hay validación externa, ni espera del worker, ni llamadas síncronas. La val
 | **DLQ** | Todo documento agotado (transitorio), rechazado permanentemente, con payload inválido o recibido con el circuito abierto se escribe en `documents:dlq` (Redis Stream) con `reason`, `attempts`, `batch_id` y `failed_at`. Si Redis también falla, cae a `dead-letter.jsonl` con `fsync`. |
 | **Contingencia sin pérdida** | En OPEN el documento **no se pierde**: se desvía a la DLQ, que es la cola de contingencia. |
 | **Broker caído/lleno** | El API escribe el lote al spool local (`/data/spool/...jsonl`), responde 202 y un replayer lo reenvía a Redis cuando vuelve. El spool se rota y reescribe atómicamente; si el proceso se cancela a mitad, las entradas no reenviadas se conservan. |
+| **Idempotencia** | Cada documento se reclama con `SET documents:seen:{document_id} NX EX 24h`. Si el lote se entregó dos veces (timeout de publicación + replay del spool), la segunda entrega se ACKea sin volver a llamar al proveedor. Si Redis no está disponible, el claim falla abierto para preservar disponibilidad. |
 | **Concurrencia del worker** | `asyncio.Semaphore` (100 por defecto) + `httpx.AsyncClient` con pool keep-alive; el event loop nunca se bloquea. |
-| **ACK siempre** | Cada entrada se ACKea en toda ruta terminal (éxito o DLQ): un documento envenenado no genera un bucle infinito de redelivery. |
+| **ACK por lote** | La unidad de la cola es el lote (máx. 1.000 documentos). Se ACKea en toda ruta terminal; un fallo a mitad de lote provoca redelivery y la idempotencia elimina los duplicados. Los documentos inválidos o agotados se desvían individualmente a la DLQ. |
 
 Reintentos y breaker se componen así: el breaker **abre la puerta**; los reintentos absorben fallos aislados; el breaker registra el **resultado final de la secuencia** de reintentos. De este modo, 5 fallos aislados con éxito posterior no abren el circuito, pero 5 validaciones consecutivas agotadas sí.
 
 ### Observabilidad
 
 - Logs JSON a stdout (`batch_id`, `document_id`, `reason`, `channel`, `attempt`).
-- `GET /api/v1/documents/stats`: aceptados, publicados, validados, rechazados, dead-lettered, profundidad de cola, backlog del spool, profundidad de DLQ y estado completo del breaker.
+- `GET /api/v1/documents/stats`: aceptados, publicados, validados, rechazados, duplicados, dead-lettered, backlog del spool, profundidad de DLQ y estado completo del breaker. Los contadores y el estado del breaker se comparten vía Redis, porque API y worker son procesos distintos; `queue_depth` es el **lag del consumer group en lotes** (`XINFO GROUPS.lag`), no el tamaño acumulado del stream.
 - `GET /health/live` y `GET /health/ready` (readiness devuelve `degraded` si Redis no responde pero el spool puede absorber trabajo).
 
-### Pruebas pytest (30 tests)
+### Pruebas pytest (40 tests)
 
 - Breaker: apertura a los 5 fallos, bloqueo durante 30 s, HALF_OPEN con un solo probe, reapertura si el probe falla, reset por éxito.
 - Retry: backoff exponencial, cap, jitter, no reintento de 4xx.
 - Validador resiliente: el circuito solo se abre con fallos **agotados**, los 4xx no lo abren, en OPEN no se llama al proveedor.
-- Procesador: éxito, transitorio agotado, circuito abierto, rechazo permanente, payload inválido, y escenario de **100 documentos con 30% de fallos** donde se verifica que `validated + dead_lettered == 100` y que las 100 entradas se ACKean.
+- Procesador: éxito, transitorio agotado, circuito abierto, rechazo permanente, payload inválido, **entrega duplicada** (no revalida y ACKea) y escenario de **100 documentos con 30% de fallos** donde se verifica que `validated + dead_lettered == 100` y que las 100 entradas se ACKean.
 - Endpoint: 1.000 documentos → 202 en <200 ms, 1.001 → 422, payload inválido → 422, batch_id autogenerado, stats y health.
+- Cola/observabilidad: un `XADD` por lote, backlog vía `XINFO GROUPS.lag`, contadores y breaker compartidos en Redis.
 - Spool/replayer: append con fsync, retención si Redis sigue caído, drenaje cuando vuelve, fallback del productor.
 
 ---
@@ -459,7 +474,7 @@ el hilo del loop queda ocupado y **ninguna otra corrutina avanza**: se serializa
 
 **Cómo lo evito:**
 
-1. **Camino de la request mínimo.** El endpoint solo valida con pydantic y publica en Redis (o escribe el spool); no llama al proveedor externo ni hace trabajo pesado. Medido: ~7 ms de servidor para 1.000 documentos.
+1. **Camino de la request mínimo.** El endpoint solo valida con pydantic y publica en Redis (o escribe el spool); no llama al proveedor externo ni hace trabajo pesado. Medido en Docker: **8,17 ms de servidor** para 1.000 documentos.
 2. **I/O asíncrono.** `httpx.AsyncClient` con pool keep-alive para el proveedor externo; `redis.asyncio` para el broker. Nunca `requests` ni `redis` síncronos dentro del loop.
 3. **Trabajo bloqueante fuera del loop.** El `append + fsync` del spool se ejecuta con `anyio.to_thread.run_sync`; para librerías síncronas inevitables usaría el mismo mecanismo. Para cálculo CPU-bound puro (limitado por el GIL) usaría un `ProcessPoolExecutor` o, mejor, lo movería a un worker/cola.
 4. **Trabajo de fondo separado.** La validación corre en `documents-worker` (otro proceso/contenedor), con `asyncio.Semaphore` para acotar concurrencia y un `httpx` async con timeouts. Un pico de validaciones no afecta al endpoint.
@@ -534,36 +549,75 @@ El spool está en un volumen (`/data/spool`), por lo que sobrevive a reinicios d
 | Componente | Versión |
 |---|---|
 | PHP | 8.3.32 (CLI, `pdo_mysql`, `pcntl`, `redis`, `bcmath`) |
-| Composer / Laravel | 2.10.3 / 12.x |
+| Composer / Laravel | 2.10.3 / 12.70 |
 | PHPUnit | 11.5.57 |
-| Base de datos | MariaDB 10.6.23 (equivalente funcional a MySQL 8 para este esquema) |
-| Python | 3.10.12 |
+| Base de datos nativa | MariaDB 10.6.23 (equivalente funcional a MySQL 8 para este esquema) |
+| Python | 3.10.12 (local) / 3.12 (imagen Docker) |
 | FastAPI / pydantic / httpx / redis-py | 0.153.0 / 2.14.1 / 0.28.1 / 6.4.0 |
 | pytest / pytest-asyncio | 8.x / 1.x |
+| Docker Engine / Compose | 29.9.1 / v5.6.0 |
+| Contenedores | MySQL 8.0, Redis 7-alpine, PHP 8.3-cli-alpine, Python 3.12-slim |
 
-> **Limitación del entorno de ejecución:** no había Docker instalado (`docker: command not found`), por lo que `docker compose up` no se pudo ejecutar aquí. El `docker-compose.yml` se validó con un parser YAML (8 servicios, 3 volúmenes, anchors resueltos) y los Dockerfiles usan imágenes oficiales; toda la lógica de las aplicaciones se ejecutó de forma nativa contra MariaDB y con uvicorn. La reproducibilidad en Docker se apoya en healthchecks y en el entrypoint idempotente.
+> **Validación en Docker:** el stack completo se levantó con `docker compose up -d --build` y se ejecutaron endpoints, benchmark de 100k, pruebas de resiliencia (breaker, Redis caído, spool) y las dos suites dentro de contenedores. Los 7 servicios de larga duración quedaron `healthy`/`running`; `laravel-test` se ejecuta bajo demanda con `docker compose run --rm laravel-test`.
+
+### Resultados en Docker
+
+```
+$ docker compose ps
+documents-api      Up (healthy)   0.0.0.0:8001->8000/tcp
+documents-worker   Up
+laravel            Up (healthy)   0.0.0.0:8000->8000/tcp
+laravel-worker     Up
+mock-external      Up (healthy)   0.0.0.0:9000->9000/tcp
+mysql              Up (healthy)   0.0.0.0:3307->3306/tcp
+redis              Up (healthy)   0.0.0.0:6379->6379/tcp
+```
+
+**Endpoint (1.000 documentos, stack completo):**
+
+```json
+{
+  "http_status": 202,
+  "accepted": 1000,
+  "channel": "redis",
+  "server_processing_time_ms": 8.17,
+  "client_roundtrip_ms": 43.02,
+  "stats": {
+    "validated_documents": 972,
+    "dead_lettered_documents": 28,
+    "duplicate_documents": 0,
+    "processed_documents": 1000,
+    "queue_depth": 0,
+    "spool_pending_batches": 0,
+    "circuit_breaker": {"state": "closed"}
+  }
+}
+```
+
+**Circuit breaker (mock al 100% de fallos):** 10 documentos → `state=open`, `consecutive_failures=5`, `retry_in_seconds=29,95`, `dead_lettered_documents=10`, `processed=10`.
+
+**Redis caído durante la ingesta:** 20 documentos → `202`, `channel=spool`, 20,13 ms de servidor; 1 lote en `/data/spool/documents-pending.jsonl`. Al volver Redis, el replayer registró `spool replay forwarded 1 batches` y el worker procesó 20/20 (1 validada + 19 a DLQ por circuito abierto), sin pérdida.
+
+**Cola Laravel:** 1.000 facturas reseteadas a `pending` → `invoices:process --queue --limit=1000 --batch=100` → 10 jobs `ProcessInvoiceBatchJob` de ~60 ms cada uno, 1.000/1.000 en estado `processed`.
 
 ### Suites de pruebas
 
 ```
-# Laravel
-$ vendor/bin/phpunit
-PHPUnit 11.5.57 by Sebastian Bergmann and contributors.
-..........................                                        26 / 26 (100%)
-Time: 00:07.447, Memory: 48.50 MB
-OK (26 tests, 82 assertions)
+# Laravel dentro de Docker
+$ docker compose run --rm -T laravel-test
+Tests:    26 passed (82 assertions)
+Duration: 10.13s
 
-# FastAPI
-$ python -m pytest
-..............................                                     [100%]
-30 passed in 0.37s
+# FastAPI dentro de Docker
+$ docker compose run --rm -T documents-api pytest
+40 passed in 0.51s
 ```
 
-La prueba de memoria de Laravel no se ejecuta dentro del proceso de PHPUnit (que ya usa ~48 MB de baseline): lanza un **subproceso real** `php -d memory_limit=32M artisan invoices:process --batch=250 --json` sobre 2.000 filas y asserta que `peak_memory_bytes < 32 MB` y que la corrida termina con exit code 0.
+La prueba de memoria de Laravel no se ejecuta dentro del proceso de PHPUnit (que ya usa ~46 MB de baseline): lanza un **subproceso real** `php -d memory_limit=32M artisan invoices:process --batch=250 --json` sobre 2.000 filas y asserta que `peak_memory_bytes < 32 MB` y que la corrida termina con exit code 0.
 
 ### Benchmarks Laravel
 
-Ver la tabla de resultados medidos: **100.000 facturas → 10,40 s, 9.618 facturas/s, pico 25,71 MB lógico (28 MB allocator)** con `php -d memory_limit=32M`.
+Ver la tabla de resultados medidos: **100.000 facturas → 10,40 s, 9.618 facturas/s, pico 25,71 MB lógico (28 MB allocator)** con `php -d memory_limit=32M`. Dentro de Docker: **6,13 MB lógico / 8 MB allocator**, 100.000 procesadas.
 
 ### Comparativa keyset vs OFFSET (`ANALYZE FORMAT=JSON`, 100k filas)
 
@@ -597,18 +651,34 @@ Los 30 documentos no validados no se perdieron: quedaron en la DLQ con `reason=t
 ### Cómo reproducir toda la evidencia
 
 ```bash
-# Laravel
-cd laravel
-php artisan test
-php artisan invoices:seed --count=100000 --chunk=500 --fresh
-APP_DEBUG=false php -d memory_limit=32M artisan invoices:process --json
-APP_DEBUG=false php -d memory_limit=32M artisan invoices:process --events=per_invoice --json
-APP_DEBUG=false php -d memory_limit=32M artisan invoices:process --transaction=single --json
+# Stack completo (Docker)
+cp .env.example .env
+docker compose up -d --build
+curl -s http://localhost:8000/up
+curl -s http://localhost:8001/health/ready
 
-# FastAPI
-cd ../services/document-service
-pytest
-python scripts/bench_endpoint.py --url http://127.0.0.1:8000 --documents 1000 --iterations 20
+# Laravel dentro de Docker
+docker compose exec laravel php -d memory_limit=32M artisan invoices:process --json
+docker compose exec laravel php -d memory_limit=32M artisan invoices:process --events=per_invoice --json
+docker compose exec laravel php -d memory_limit=32M artisan invoices:process --transaction=single --json
+docker compose exec laravel php artisan invoices:process --queue --limit=1000 --batch=100
+
+# Suites dentro de Docker
+docker compose run --rm -T laravel-test
+docker compose run --rm -T documents-api pytest
+
+# API: 1.000 documentos y estadísticas compartidas
+python services/document-service/scripts/bench_endpoint.py \
+  --url http://localhost:8001 --documents 1000 --iterations 20
+curl -s http://localhost:8001/api/v1/documents/stats | python3 -m json.tool
+
+# Resiliencia: circuito abierto al 100% de fallos / Redis caído
+MOCK_FAILURE_RATE=1 docker compose up -d --force-recreate mock-external
+docker stop estupendo-backend-challenge-redis-1   # y docker start para el replay
+
+# Alternativa nativa
+cd laravel && php artisan test && DB_HOST=… php artisan test
+cd ../services/document-service && pytest
 ```
 
 ---
@@ -616,6 +686,8 @@ python scripts/bench_endpoint.py --url http://127.0.0.1:8000 --documents 1000 --
 ## Trade-offs y siguientes pasos
 
 - **`php artisan serve` es solo para la demo.** En producción: php-fpm + nginx o Laravel Octane; el ALB habla HTTP con el pool de PHP-FPM. El comando de facturas corre en un worker/job, nunca en el proceso web.
+- **Entrega at-least-once, no exactly-once.** Un timeout de publicación puede dejar el lote tanto en Redis como en el spool. La idempotencia por `document_id` (`SET NX` con TTL 24 h) hace que la segunda entrega sea un no-op y se ACKea; sin Redis el claim falla abierto para no sacrificar disponibilidad.
+- **La unidad de la cola es el lote.** `XINFO GROUPS.lag` y `queue_depth` cuentan **lotes pendientes**, no documentos. Para capacidad por documento, multiplicar por el tamaño medio de lote o exportar un contador aparte.
 - **Compose es de una sola instancia por servicio.** No pretende ser HA; la sección AWS describe la topología multi-AZ con RDS Multi-AZ, ElastiCache con failover y autoescalado.
 - **Redis Streams tiene retención por `maxlen` aproximado.** Bajo presión extrema podría recortar entradas antiguas; de ahí la DLQ, las alarmas y la recomendación de SQS/Kinesis en AWS como buffer durable.
 - **El spool asume un único replayer por volumen.** Escalar `documents-api` exige particionar el spool por instancia o coordinarlo con un lock (S3 + DynamoDB) — documentado en la sección AWS.
@@ -623,7 +695,8 @@ python scripts/bench_endpoint.py --url http://127.0.0.1:8000 --documents 1000 --
 - **Autenticación fuera del alcance del enunciado.** En producción añadiría OAuth2/JWT o mTLS entre servicios, API keys por tenant, rate limiting y cuotas; el endpoint actual está pensado para una red privada detrás del ALB.
 - **Los tests de Laravel usan MySQL/MariaDB** porque el binario PHP local no incluye `pdo_sqlite`; `phpunit.xml` apunta a `127.0.0.1:3306` / `estupendo_test` y en Docker se crea con el init script. Para apuntar a otro servidor: `DB_HOST=… DB_PORT=… php artisan test`. No es una dependencia de la solución, solo del entorno de validación.
 - **Laravel 10 se descartó** porque Composer 2.10 bloquea sus versiones por avisos de seguridad; se eligió Laravel 12 sobre PHP 8.3 (el mismo runtime que usa la imagen Docker).
-- **Siguientes pasos**: outbox transaccional para eventos, tienda de idempotencia (Redis/DynamoDB) por `document_id`, OpenTelemetry + dashboards, Terraform del diagrama AWS, pruebas de caos con k6/Toxiproxy y un contrato de eventos versionado.
+- **Hallazgos corregidos durante la prueba en Docker:** (1) `socket_timeout` de 0.5 s era menor que el `BLOCK 2000 ms` de `XREADGROUP` y generaba timeouts en bucle — ahora es configurable y mayor que el bloqueo; (2) la imagen de testing no regeneraba el package manifest y `artisan test` no existía — se añadió `package:discover` y `.env.testing`; (3) publicar 1.000 entradas por request acercaba la latencia a 200 ms bajo carga del worker — se pasó a **1 XADD por lote**, con idempotencia para los reintentos.
+- **Siguientes pasos**: outbox transaccional para eventos de Laravel, OpenTelemetry + dashboards, Terraform del diagrama AWS, pruebas de caos con k6/Toxiproxy, y contrato de eventos versionado.
 
 ---
 
@@ -635,19 +708,21 @@ python scripts/bench_endpoint.py --url http://127.0.0.1:8000 --documents 1000 --
 | 1.2 | Cálculo de impuestos | `CalculateInvoiceTax` (enteros, half-up) | tests unitarios + verificación end-to-end |
 | 1.3 | Evento global por factura | `InvoiceProcessed` (`--events=per_invoice`) + `InvoiceBatchProcessed` por defecto | 100.000 eventos despachados en 15,31 s |
 | 1.4 | `DB::transaction` única | `--transaction=single` implementado y medido | 10,97 s, 50.373 locks a los 5 s |
-| 1.5 | Pico de RAM < 32 MB | PDO unbuffered + keyset + arrays + bulk update + `MemoryGuard` + `memory_limit=32M` | **25,71 MB** lógicos / 28 MB allocator |
+| 1.5 | Pico de RAM < 32 MB | PDO unbuffered + keyset + arrays + bulk update + `MemoryGuard` + `memory_limit=32M` | **25,71 MB** nativo / **6,13 MB** en Docker (límite 32 MB) |
 | 1.6 | Sin paginación OFFSET | Keyset `id > lastId` con índice `(status, id)` | 501 vs 100.000 filas leídas |
 | 1.7 | Arquitectura limpia | Actions, Services, DTOs, Events, Listener, Jobs/Queues, Commands | estructura del repositorio |
-| 2.1 | Endpoint `async def` `/api/v1/documents/process` | `app/api/v1/endpoints/documents.py` | 202 medido en ~7 ms de servidor |
+| 2.1 | Endpoint `async def` `/api/v1/documents/process` | `app/api/v1/endpoints/documents.py` | **8,17 ms** de servidor en Docker |
 | 2.2 | Hasta 1.000 documentos | pydantic `max_length=1000` + límite en settings | 1.001 → 422 |
-| 2.3 | 202 en < 200 ms | pipeline Redis / spool fsync; sin trabajo pesado en la request | test de latencia + smoke real |
-| 2.4 | Procesamiento en segundo plano | `documents-worker` + Redis Streams consumer group | 1.000 documentos procesados, cola a 0 |
+| 2.3 | 202 en < 200 ms | 1 `XADD` por lote / spool fsync; sin trabajo pesado en la request | 8,17 ms servidor / 43 ms cliente en Docker |
+| 2.4 | Procesamiento en segundo plano | `documents-worker` + Redis Streams consumer group | 1.000 documentos: 972 + 28 DLQ, lag 0 |
 | 2.5 | Retry + Exponential Backoff | `RetryPolicy` + `call_with_retry` (jitter, cap) | tests de delays [0,1; 0,2] y cap |
-| 2.6 | Circuit breaker 5 fallos / 30 s | `CircuitBreaker` CLOSED→OPEN→HALF_OPEN | 5 fallos abren; 30 s; un probe |
-| 2.7 | Cola de contingencia / DLQ | `documents:dlq` + fallback `dead-letter.jsonl` | 30 documentos desviados en el smoke |
-| 3.1 | `docker-compose.yml` funcional | Laravel, FastAPI, MySQL, Redis (+ workers y mock) | YAML validado; healthchecks y depends_on |
+| 2.6 | Circuit breaker 5 fallos / 30 s | `CircuitBreaker` CLOSED→OPEN→HALF_OPEN | Docker: 5 fallos → OPEN, retry 29,95 s, 10/10 a DLQ |
+| 2.7 | Cola de contingencia / DLQ | `documents:dlq` + fallback `dead-letter.jsonl` | 28 documentos finales + 10 en prueba de breaker |
+| 2.8 | Sin pérdida ni duplicados | ACK por lote + idempotencia `SET NX` por `document_id` | 1.000 procesadas, `duplicate_documents=0` |
+| 3.1 | `docker-compose.yml` funcional | Laravel, FastAPI, MySQL, Redis (+ workers y mock) | **Stack levantado y validado en Docker 29.9.1**; 7 servicios healthy/running |
 | 3.2 | README con arquitectura AWS HA | Sección AWS con diagrama y tabla por capa | este documento |
 | 4 | Cuatro respuestas del cuestionario | Sección “Cuestionario de defensa técnica” | este documento |
+| 5 | Pruebas automatizadas | PHPUnit + pytest, también dentro de Docker | **26 tests / 82 assertions** y **40 tests** |
 
 ---
 

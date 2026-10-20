@@ -63,3 +63,7 @@ class ResilientValidator:
         else:
             await self._breaker.record_success()
             return result
+
+    async def snapshot(self):
+        """Current breaker state, for worker -> API observability."""
+        return await self._breaker.snapshot()

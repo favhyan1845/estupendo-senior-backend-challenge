@@ -117,7 +117,7 @@ async def test_replayer_moves_spooled_batches_to_redis_once_it_recovers(tmp_path
 
     assert await replayer.replay_once() == 1
     assert await spool.pending_batches() == 0
-    assert await redis_backend.depth() == 2
+    assert await redis_backend.depth() == 1, "one entry per replayed batch"
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ class Metrics:
     processed_batches: int = 0
     validated_documents: int = 0
     rejected_documents: int = 0
+    duplicate_documents: int = 0
     dead_lettered_documents: int = 0
     processed_documents: int = 0
     retries: int = 0

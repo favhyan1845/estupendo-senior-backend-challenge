@@ -30,6 +30,26 @@ class ScriptedClient:
         return outcome
 
 
+class SharedStub:
+    """Minimal SharedMetrics replacement for duplicate-delivery tests."""
+
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+        self.counters: dict[str, int] = {}
+
+    async def claim_document(self, document_id: str) -> bool:
+        if document_id in self.seen:
+            return False
+        self.seen.add(document_id)
+        return True
+
+    async def incr(self, field: str, amount: int = 1) -> None:
+        self.counters[field] = self.counters.get(field, 0) + amount
+
+    async def set_breaker(self, payload: dict[str, Any]) -> None:
+        return None
+
+
 async def no_sleep(_: float) -> None:
     return None
 
@@ -40,6 +60,7 @@ def build_processor(
     *,
     breaker: CircuitBreaker | None = None,
     max_attempts: int = 2,
+    shared_metrics=None,
 ) -> tuple[DocumentProcessor, InMemoryDocumentQueue, Metrics]:
     queue = InMemoryDocumentQueue()
     metrics = Metrics()
@@ -56,6 +77,7 @@ def build_processor(
         queue=queue,
         dlq=dlq,
         metrics=metrics,
+        shared_metrics=shared_metrics,
         max_inflight=10,
         max_attempts=max_attempts,
     )
@@ -64,7 +86,11 @@ def build_processor(
 
 
 def message(document: dict[str, Any] | None = None) -> QueueMessage:
-    return QueueMessage(id="1-0", batch_id="batch-1", document=document or make_document(1))
+    return QueueMessage(
+        id="1-0",
+        batch_id="batch-1",
+        documents=[document or make_document(1)],
+    )
 
 
 @pytest.mark.asyncio
@@ -154,7 +180,11 @@ async def test_no_document_is_lost_under_a_thirty_percent_failure_rate(tmp_path,
     processor, queue, metrics = build_processor(tmp_path, client, max_attempts=3)
 
     messages = [
-        QueueMessage(id=f"{index}-0", batch_id="batch-load", document=make_document(index))
+        QueueMessage(
+            id=f"{index}-0",
+            batch_id="batch-load",
+            documents=[make_document(index)],
+        )
         for index in range(1, 101)
     ]
 
@@ -164,3 +194,23 @@ async def test_no_document_is_lost_under_a_thirty_percent_failure_rate(tmp_path,
     assert metrics.validated_documents + metrics.dead_lettered_documents == 100
     assert metrics.dead_lettered_documents > 0
     assert len(read_dlq()) == metrics.dead_lettered_documents
+
+
+@pytest.mark.asyncio
+async def test_a_duplicate_delivery_is_acked_without_calling_the_provider(tmp_path) -> None:
+    client = ScriptedClient()
+    shared = SharedStub()
+    processor, queue, metrics = build_processor(
+        tmp_path,
+        client,
+        shared_metrics=shared,
+    )
+
+    await processor.process(message())
+    await processor.process(message())
+
+    assert client.calls == 1, "at-least-once delivery must not validate twice"
+    assert metrics.validated_documents == 1
+    assert metrics.duplicate_documents == 1
+    assert len(queue.acked) == 2, "duplicates must still be ACKed"
+    assert shared.counters["duplicates"] == 1

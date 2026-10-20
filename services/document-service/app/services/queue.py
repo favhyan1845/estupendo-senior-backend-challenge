@@ -1,12 +1,11 @@
 """Queue abstractions.
 
 Production uses Redis Streams + consumer groups:
-  * every document is its own stream entry, so a malformed/poison document
-    cannot block its 999 siblings;
+  * one stream entry per **batch** (up to 1,000 documents): the request path
+    performs a single XADD, so the ACK unit is the batch; a crash mid-batch
+    redelivers it and the per-document idempotency key removes duplicates;
   * XACK gives at-least-once delivery and pending-entry recovery;
-  * the producer writes each batch in a single MULTI/EXEC pipeline, which is
-    one network round trip and all-or-nothing (no partial batches that later
-    get duplicated by the spool replay).
+  * ``XINFO GROUPS.lag`` is the operational backlog (batches, not documents).
 
 ``InMemoryDocumentQueue`` mirrors the same contract for local runs and tests.
 """
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 class QueueMessage:
     id: str
     batch_id: str
-    document: dict[str, Any]
+    documents: list[dict[str, Any]]
 
 
 class DocumentQueue(Protocol):
@@ -65,20 +64,21 @@ class RedisDocumentQueue:
                 raise
 
     async def enqueue(self, batch_id: str, documents: list[dict[str, Any]]) -> int:
-        pipe = self._client.pipeline(transaction=True)
+        if not documents:
+            return 0
 
-        for document in documents:
-            pipe.xadd(
-                self._stream,
-                {
-                    "batch_id": batch_id,
-                    "document": json.dumps(document, separators=(",", ":"), default=str),
-                },
-                maxlen=self._max_length,
-                approximate=True,
-            )
-
-        await pipe.execute()
+        # One stream entry per batch: the request does a single XADD (~ms)
+        # instead of 1,000, which keeps the 202 path well under 200 ms even
+        # when workers are hammering Redis.
+        await self._client.xadd(
+            self._stream,
+            {
+                "batch_id": batch_id,
+                "documents": json.dumps(documents, separators=(",", ":"), default=str),
+            },
+            maxlen=self._max_length,
+            approximate=True,
+        )
 
         return len(documents)
 
@@ -96,11 +96,22 @@ class RedisDocumentQueue:
         for _stream, entries in response or []:
             for entry_id, fields in entries:
                 try:
+                    batch_id = str(fields.get("batch_id", ""))
+
+                    if "documents" in fields:
+                        documents = json.loads(fields["documents"])
+                    else:
+                        # Backwards compatibility with single-document entries.
+                        documents = [json.loads(fields["document"])]
+
+                    if not isinstance(documents, list) or not documents:
+                        raise ValueError("empty batch")
+
                     messages.append(
                         QueueMessage(
                             id=entry_id,
-                            batch_id=str(fields.get("batch_id", "")),
-                            document=json.loads(fields["document"]),
+                            batch_id=batch_id,
+                            documents=documents,
                         )
                     )
                 except (KeyError, ValueError, TypeError):
@@ -114,7 +125,37 @@ class RedisDocumentQueue:
         return int(await self._client.xack(self._stream, self._group, message.id))
 
     async def depth(self) -> int | None:
-        return int(await self._client.xlen(self._stream))
+        """Backlog of the consumer group (``lag``), not cumulative stream length.
+
+        XLEN keeps growing with acked entries, so it is a poor operational
+        metric. ``XINFO GROUPS.lag`` is the number of entries not yet delivered
+        to the group, which is what autoscaling/alerts should watch.
+        """
+        try:
+            groups = await self._client.xinfo_groups(self._stream)
+        except Exception:
+            try:
+                return int(await self._client.xlen(self._stream))
+            except Exception:
+                return None
+
+        for group in groups:
+            if group.get("name") != self._group:
+                continue
+
+            lag = group.get("lag")
+            if lag is not None:
+                return int(lag)
+
+            stream_length = int(group.get("stream-length") or await self._client.xlen(self._stream))
+            entries_read = group.get("entries-read")
+
+            if entries_read is None:
+                return stream_length - int(group.get("pending") or 0)
+
+            return max(0, stream_length - int(entries_read))
+
+        return None
 
 
 class InMemoryDocumentQueue:
@@ -129,11 +170,17 @@ class InMemoryDocumentQueue:
         return None
 
     async def enqueue(self, batch_id: str, documents: list[dict[str, Any]]) -> int:
-        for document in documents:
-            self._counter += 1
-            await self._queue.put(
-                QueueMessage(id=f"mem-{self._counter}", batch_id=batch_id, document=document)
+        if not documents:
+            return 0
+
+        self._counter += 1
+        await self._queue.put(
+            QueueMessage(
+                id=f"mem-{self._counter}",
+                batch_id=batch_id,
+                documents=list(documents),
             )
+        )
 
         return len(documents)
 

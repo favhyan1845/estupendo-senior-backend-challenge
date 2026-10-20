@@ -22,6 +22,7 @@ from app.services.errors import PermanentExternalError, TransientExternalError
 from app.services.metrics import Metrics
 from app.services.queue import DocumentQueue, QueueMessage
 from app.services.resilient_validator import ResilientValidator
+from app.services.shared_metrics import SharedMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,7 @@ class DocumentProcessor:
         queue: DocumentQueue,
         dlq: DeadLetterStore,
         metrics: Metrics,
+        shared_metrics: SharedMetrics | None = None,
         max_inflight: int = 100,
         max_attempts: int = 3,
     ) -> None:
@@ -41,18 +43,26 @@ class DocumentProcessor:
         self._queue = queue
         self._dlq = dlq
         self._metrics = metrics
+        self._shared = shared_metrics or SharedMetrics(None)
         self._max_attempts = max_attempts
         self._semaphore = asyncio.Semaphore(max_inflight)
 
     async def process(self, message: QueueMessage) -> None:
         try:
-            await self._process_document(message.batch_id, message.document)
+            await asyncio.gather(
+                *(
+                    self._process_document(message.batch_id, document)
+                    for document in message.documents
+                )
+            )
         finally:
-            # ACK even on unexpected errors: the document is already parked in
-            # the DLQ (or was a duplicate); redelivery would only add noise.
+            # ACK even on unexpected errors: the documents are already parked
+            # in the DLQ (or were duplicates); redelivery would only add noise.
             await self._queue.ack(message)
 
-        self._metrics.processed_documents += 1
+        processed = len(message.documents)
+        self._metrics.processed_documents += processed
+        await self._shared.incr("processed", processed)
 
     async def process_many(self, messages: list[QueueMessage]) -> None:
         await asyncio.gather(*(self.process(message) for message in messages))
@@ -65,6 +75,14 @@ class DocumentProcessor:
                 reason="invalid_payload",
                 attempts=0,
             )
+
+            return
+
+        document_id = str(document["document_id"])
+
+        if not await self._shared.claim_document(document_id):
+            self._metrics.duplicate_documents += 1
+            await self._shared.incr("duplicates")
 
             return
 
@@ -94,8 +112,19 @@ class DocumentProcessor:
             else:
                 if result.get("valid", True):
                     self._metrics.validated_documents += 1
+                    await self._shared.incr("validated")
                 else:
                     self._metrics.rejected_documents += 1
+                    await self._shared.incr("rejected")
+            finally:
+                await self._publish_breaker()
+
+    async def _publish_breaker(self) -> None:
+        try:
+            snapshot = await self._validator.snapshot()
+            await self._shared.set_breaker(snapshot.model_dump(mode="json"))
+        except Exception:  # observability must never break processing
+            logger.debug("could not publish breaker snapshot", exc_info=True)
 
     async def _dead_letter(
         self,
@@ -112,6 +141,7 @@ class DocumentProcessor:
             attempts=attempts,
         )
         self._metrics.record_dead_letter(channel)
+        await self._shared.incr("dead_lettered")
 
         logger.warning(
             "document dead-lettered",
