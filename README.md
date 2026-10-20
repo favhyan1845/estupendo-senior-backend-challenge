@@ -112,10 +112,15 @@ El entrypoint de Laravel espera a MySQL, ejecuta migraciones y siembra `SEED_INV
 ```bash
 cd laravel
 composer install
+cp .env.example .env
+php artisan key:generate
+# Ajusta DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD en .env
+# y crea la base de datos `estupendo` (MySQL 8 / MariaDB 10.6+).
 php artisan migrate
 php artisan invoices:seed --count=100000 --chunk=500
 php -d memory_limit=32M artisan invoices:process --json
-php artisan test
+# Para tests contra otra instancia:
+# DB_HOST=127.0.0.1 DB_PORT=3306 php artisan test
 ```
 
 **FastAPI** (Python 3.10+):
