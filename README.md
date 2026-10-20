@@ -616,7 +616,7 @@ python scripts/bench_endpoint.py --url http://127.0.0.1:8000 --documents 1000 --
 - **El spool asume un único replayer por volumen.** Escalar `documents-api` exige particionar el spool por instancia o coordinarlo con un lock (S3 + DynamoDB) — documentado en la sección AWS.
 - **La DLQ no se reprocesa automáticamente.** Es deliberado: un replay masivo contra un proveedor aún caído agravaría el incidente. Hay un runbook manual con rate limit.
 - **Autenticación fuera del alcance del enunciado.** En producción añadiría OAuth2/JWT o mTLS entre servicios, API keys por tenant, rate limiting y cuotas; el endpoint actual está pensado para una red privada detrás del ALB.
-- **Los tests de Laravel usan MySQL/MariaDB** porque el binario PHP local no incluye `pdo_sqlite`; `phpunit.xml` apunta a `estupendo_test` y en Docker se crea con el init script. No es una dependencia de la solución, solo del entorno de validación.
+- **Los tests de Laravel usan MySQL/MariaDB** porque el binario PHP local no incluye `pdo_sqlite`; `phpunit.xml` apunta a `127.0.0.1:3306` / `estupendo_test` y en Docker se crea con el init script. Para apuntar a otro servidor: `DB_HOST=… DB_PORT=… php artisan test`. No es una dependencia de la solución, solo del entorno de validación.
 - **Laravel 10 se descartó** porque Composer 2.10 bloquea sus versiones por avisos de seguridad; se eligió Laravel 12 sobre PHP 8.3 (el mismo runtime que usa la imagen Docker).
 - **Siguientes pasos**: outbox transaccional para eventos, tienda de idempotencia (Redis/DynamoDB) por `document_id`, OpenTelemetry + dashboards, Terraform del diagrama AWS, pruebas de caos con k6/Toxiproxy y un contrato de eventos versionado.
 
