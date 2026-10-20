@@ -80,35 +80,38 @@ class DiskSpool:
             await anyio.to_thread.run_sync(self._rotate_sync)
             lines = await anyio.to_thread.run_sync(self._read_processing_sync)
 
-            forwarded = 0
-            failed: list[SpoolEntry] = []
-
+            entries: list[SpoolEntry] = []
             for line in lines:
                 line = line.strip()
                 if not line:
                     continue
-
                 try:
-                    entry = SpoolEntry.from_json(line)
+                    entries.append(SpoolEntry.from_json(line))
                 except (ValueError, KeyError, TypeError):
                     logger.error("discarding unreadable spool line", extra={"reason": "unreadable_spool"})
-                    continue
 
-                try:
-                    delivered = await forward(entry)
-                except asyncio.CancelledError:
-                    failed.append(entry)
-                    raise
-                except Exception:  # pragma: no cover - defensive
-                    logger.exception("spool forwarder crashed")
-                    delivered = False
+            forwarded = 0
+            failed: list[SpoolEntry] = []
 
-                if delivered:
-                    forwarded += 1
-                else:
-                    failed.append(entry)
+            try:
+                for index, entry in enumerate(entries):
+                    try:
+                        delivered = await forward(entry)
+                    except asyncio.CancelledError:
+                        # Put the in-flight entry and everything not yet tried
+                        # back into the spool before propagating shutdown.
+                        failed.extend(entries[index:])
+                        raise
+                    except Exception:  # pragma: no cover - defensive
+                        logger.exception("spool forwarder crashed")
+                        delivered = False
 
-            await anyio.to_thread.run_sync(self._rewrite_failed_sync, failed)
+                    if delivered:
+                        forwarded += 1
+                    else:
+                        failed.append(entry)
+            finally:
+                await anyio.to_thread.run_sync(self._rewrite_failed_sync, failed)
 
             return forwarded
 
