@@ -48,6 +48,12 @@
             "@php artisan config:clear --ansi",
             "@php artisan test"
         ],
+        "bench:invoices": [
+            "@php -d memory_limit=32M artisan invoices:process --json"
+        ],
+        "bench:invoices:per-invoice": [
+            "@php -d memory_limit=32M artisan invoices:process --events=per_invoice --json"
+        ],
         "post-autoload-dump": [
             "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
             "@php artisan package:discover --ansi"

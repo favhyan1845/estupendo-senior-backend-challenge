@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class PublishReceipt:
     batch_id: str
     accepted: int
-    channel: Literal["redis", "spool"]
+    channel: Literal["redis", "spool", "memory"]
     received_at: datetime
 
 
@@ -43,11 +43,13 @@ class DurableBatchProducer:
         *,
         publish_timeout_seconds: float,
         metrics: Metrics,
+        broker_channel: Literal["redis", "memory"] = "redis",
     ) -> None:
         self._queue = queue
         self._spool = spool
         self._timeout = publish_timeout_seconds
         self._metrics = metrics
+        self._broker_channel = broker_channel
 
     async def publish(
         self,
@@ -89,11 +91,11 @@ class DurableBatchProducer:
             )
 
         self._metrics.record_acceptance(len(payload))
-        self._metrics.record_publish("redis", len(payload))
+        self._metrics.record_publish(self._broker_channel, len(payload))
 
         return PublishReceipt(
             batch_id=batch_id,
             accepted=len(payload),
-            channel="redis",
+            channel=self._broker_channel,
             received_at=received_at,
         )

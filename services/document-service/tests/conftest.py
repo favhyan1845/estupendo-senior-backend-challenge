@@ -75,6 +75,7 @@ def build_runtime(
         spool,
         publish_timeout_seconds=settings.publish_timeout_seconds,
         metrics=metrics,
+        broker_channel="memory",
     )
     replayer = SpoolReplayer(
         spool,

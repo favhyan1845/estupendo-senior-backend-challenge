@@ -96,7 +96,7 @@ async def test_producer_spools_when_redis_is_unavailable(tmp_path: Path, setting
     assert receipt.accepted == 2
     assert await spool.pending_batches() == 1
     assert metrics.published_to_spool == 2
-    assert metrics.published_to_redis == 0
+    assert metrics.published_to_broker == 0
     assert queue.attempts == 1
 
 

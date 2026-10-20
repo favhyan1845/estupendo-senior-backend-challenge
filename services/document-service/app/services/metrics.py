@@ -14,13 +14,14 @@ from dataclasses import dataclass, field
 class Metrics:
     accepted_batches: int = 0
     accepted_documents: int = 0
-    published_to_redis: int = 0
+    published_to_broker: int = 0
     published_to_spool: int = 0
     replayed_batches: int = 0
     processed_batches: int = 0
     validated_documents: int = 0
     rejected_documents: int = 0
     dead_lettered_documents: int = 0
+    processed_documents: int = 0
     retries: int = 0
     dead_letter_channels: dict[str, int] = field(default_factory=dict)
 
@@ -29,10 +30,10 @@ class Metrics:
         self.accepted_documents += documents
 
     def record_publish(self, channel: str, documents: int) -> None:
-        if channel == "redis":
-            self.published_to_redis += documents
-        else:
+        if channel == "spool":
             self.published_to_spool += documents
+        else:
+            self.published_to_broker += documents
 
     def record_dead_letter(self, channel: str) -> None:
         self.dead_lettered_documents += 1

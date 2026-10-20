@@ -113,6 +113,7 @@ async def build_runtime(settings: Settings) -> Runtime:
         spool,
         publish_timeout_seconds=settings.publish_timeout_seconds,
         metrics=metrics,
+        broker_channel="redis" if settings.redis_enabled else "memory",
     )
 
     replayer = SpoolReplayer(

@@ -52,7 +52,7 @@ class DocumentProcessor:
             # the DLQ (or was a duplicate); redelivery would only add noise.
             await self._queue.ack(message)
 
-        self._metrics.processed_batches += 1
+        self._metrics.processed_documents += 1
 
     async def process_many(self, messages: list[QueueMessage]) -> None:
         await asyncio.gather(*(self.process(message) for message in messages))

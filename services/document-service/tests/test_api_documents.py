@@ -28,9 +28,9 @@ async def test_accepts_1000_documents_in_under_200_milliseconds(client, runtime)
     assert body["batch_id"] == "batch-test-001"
     assert body["accepted"] == 1000
     assert body["status"] == "accepted"
-    assert body["channel"] == "redis"
+    assert body["channel"] == "memory"
     assert body["processing_time_ms"] < 200
-    assert response.headers["X-Queue-Channel"] == "redis"
+    assert response.headers["X-Queue-Channel"] == "memory"
     assert elapsed_ms < 200, f"Endpoint took {elapsed_ms:.1f} ms"
 
     assert await runtime.queue.depth() == 1000
@@ -86,7 +86,7 @@ async def test_stats_expose_breaker_state_and_queue_depth(client) -> None:
     body = response.json()
     assert body["accepted_batches"] == 1
     assert body["accepted_documents"] == 3
-    assert body["published_to_redis"] == 3
+    assert body["published_to_broker"] == 3
     assert body["queue_depth"] == 3
     assert body["circuit_breaker"]["state"] == "closed"
     assert body["circuit_breaker"]["failure_threshold"] == 5

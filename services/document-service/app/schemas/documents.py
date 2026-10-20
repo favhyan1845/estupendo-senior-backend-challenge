@@ -31,7 +31,7 @@ class BatchAccepted(BaseModel):
     batch_id: str
     accepted: int
     status: Literal["accepted"] = "accepted"
-    channel: Literal["redis", "spool"]
+    channel: Literal["redis", "spool", "memory"]
     received_at: datetime
     processing_time_ms: float
 
@@ -57,12 +57,12 @@ class BreakerSnapshot(BaseModel):
 class ServiceStats(BaseModel):
     accepted_batches: int
     accepted_documents: int
-    published_to_redis: int
+    published_to_broker: int
     published_to_spool: int
     validated_documents: int
     rejected_documents: int
     dead_lettered_documents: int
-    processed_batches: int
+    processed_documents: int
     spool_pending_batches: int
     dlq_depth: int | None = None
     queue_depth: int | None = None

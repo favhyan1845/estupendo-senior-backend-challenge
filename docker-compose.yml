@@ -1,0 +1,259 @@
+name: estupendo-backend-challenge
+
+# ---------------------------------------------------------------------------
+# Shared environment
+# ---------------------------------------------------------------------------
+x-laravel-env: &laravel-env
+  APP_NAME: "Estupendo Invoices"
+  APP_ENV: production
+  APP_DEBUG: "false"
+  APP_KEY: "base64:1b2ZTO+Y/bjmwzSjsz1ffQHnYwjRR398knldvmJjdms="
+  APP_URL: "http://localhost:8000"
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: info
+  DB_CONNECTION: mysql
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_DATABASE: "${MYSQL_DATABASE:-estupendo}"
+  DB_USERNAME: "${MYSQL_USER:-estupendo}"
+  DB_PASSWORD: "${MYSQL_PASSWORD:-secret}"
+  REDIS_CLIENT: phpredis
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  QUEUE_CONNECTION: redis
+  INVOICES_MEMORY_LIMIT_MB: "32"
+  INVOICES_BATCH_SIZE: "500"
+  INVOICES_QUEUE: invoices
+
+x-documents-env: &documents-env
+  DOCS_ENVIRONMENT: production
+  DOCS_LOG_LEVEL: INFO
+  DOCS_REDIS_ENABLED: "true"
+  DOCS_REDIS_URL: "redis://redis:6379/0"
+  DOCS_QUEUE_STREAM: "documents:inbox"
+  DOCS_CONSUMER_GROUP: "document-workers"
+  DOCS_DLQ_STREAM: "documents:dlq"
+  DOCS_EXTERNAL_BASE_URL: "http://mock-external:9000"
+  DOCS_EXTERNAL_TIMEOUT_SECONDS: "2.0"
+  DOCS_PUBLISH_TIMEOUT_MS: "150"
+  DOCS_RETRY_MAX_ATTEMPTS: "3"
+  DOCS_RETRY_BASE_DELAY_SECONDS: "0.1"
+  DOCS_RETRY_MAX_DELAY_SECONDS: "2.0"
+  DOCS_RETRY_JITTER_RATIO: "0.2"
+  DOCS_CIRCUIT_FAILURE_THRESHOLD: "5"
+  DOCS_CIRCUIT_RECOVERY_SECONDS: "30"
+  DOCS_WORKER_BATCH_SIZE: "50"
+  DOCS_WORKER_MAX_INFLIGHT: "100"
+  DOCS_SPOOL_PATH: "/data/spool/documents-pending.jsonl"
+  DOCS_SPOOL_FLUSH_INTERVAL_SECONDS: "2.0"
+
+services:
+  # -------------------------------------------------------------------------
+  # MySQL 8 (system of record)
+  # -------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    command:
+      - "--max-connections=300"
+      - "--innodb-buffer-pool-size=256M"
+      - "--innodb-flush-log-at-trx-commit=1"
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-root}"
+      MYSQL_DATABASE: "${MYSQL_DATABASE:-estupendo}"
+      MYSQL_USER: "${MYSQL_USER:-estupendo}"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-secret}"
+    ports:
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Redis 7: queue + cache. noeviction on purpose: silently evicting queue
+  # entries would lose documents, so writes fail and the API spools to disk.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "noeviction"
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Laravel API (health endpoint + artisan serve for the demo)
+  # -------------------------------------------------------------------------
+  laravel:
+    build:
+      context: ./laravel
+      target: runtime
+    environment:
+      <<: *laravel-env
+      WAIT_FOR_DATABASE: "true"
+      RUN_MIGRATIONS: "true"
+      SEED_INVOICES: "${SEED_INVOICES:-100000}"
+      PHP_CLI_SERVER_WORKERS: "4"
+    ports:
+      - "${LARAVEL_PORT:-8000}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/up >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Laravel queue worker: consumes the ProcessInvoiceBatchJob chain
+  # -------------------------------------------------------------------------
+  laravel-worker:
+    build:
+      context: ./laravel
+      target: runtime
+    command:
+      - "php"
+      - "artisan"
+      - "queue:work"
+      - "redis"
+      - "--queue=invoices"
+      - "--sleep=1"
+      - "--tries=3"
+      - "--timeout=120"
+    environment:
+      <<: *laravel-env
+      WAIT_FOR_DATABASE: "true"
+      RUN_MIGRATIONS: "false"
+      SEED_INVOICES: "0"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Laravel test runner: docker compose run --rm laravel-test
+  # -------------------------------------------------------------------------
+  laravel-test:
+    profiles: ["test"]
+    build:
+      context: ./laravel
+      target: testing
+    command: ["php", "artisan", "test"]
+    environment:
+      <<: *laravel-env
+      APP_ENV: testing
+      APP_DEBUG: "true"
+      DB_DATABASE: estupendo_test
+      WAIT_FOR_DATABASE: "true"
+      RUN_MIGRATIONS: "false"
+      SEED_INVOICES: "0"
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      INVOICES_MEMORY_LIMIT_MB: "512"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------
+  # FastAPI ingestion API
+  # -------------------------------------------------------------------------
+  documents-api:
+    build:
+      context: ./services/document-service
+    environment:
+      <<: *documents-env
+      DOCS_EMBEDDED_WORKER: "false"
+    ports:
+      - "${DOCUMENTS_API_PORT:-8001}:8000"
+    volumes:
+      - documents-spool:/data/spool
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-external:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # FastAPI background worker (validates against the mock provider)
+  # -------------------------------------------------------------------------
+  documents-worker:
+    build:
+      context: ./services/document-service
+    command: ["python", "-m", "app.workers.consumer"]
+    environment:
+      <<: *documents-env
+      DOCS_WORKER_CONSUMER_NAME: "worker-1"
+    volumes:
+      - documents-spool:/data/spool
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-external:
+        condition: service_started
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Simulated third-party validator: 30% of requests fail with 503
+  # -------------------------------------------------------------------------
+  mock-external:
+    build:
+      context: ./services/document-service
+    command: ["uvicorn", "app.workers.mock_external:app", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      MOCK_FAILURE_RATE: "${MOCK_FAILURE_RATE:-0.3}"
+      MOCK_LATENCY_MS: "${MOCK_LATENCY_MS:-25}"
+    ports:
+      - "${MOCK_EXTERNAL_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  documents-spool:
+
+
+
+
