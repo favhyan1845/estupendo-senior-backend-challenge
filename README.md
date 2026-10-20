@@ -274,17 +274,17 @@ flowchart TB
 
 ### 1. Laravel & PDO: ¿por qué `Invoice::all()->each(...)` o `chunk()` agotan la memoria o ralentizan MySQL, y cómo lo solucioné?
 
-Problema: El procesamiento masivo de facturas (100.000 registros) consumía cientos de MB de memoria y se degradaba progresivamente: a medida que avanzaba, cada lote tardaba más. En producción esto significa riesgo de timeouts, caídas del servicio y bloqueos de la base de datos.
+**Problema:** El procesamiento masivo de facturas (100.000 registros) consumía cientos de MB de memoria y se degradaba progresivamente: a medida que avanzaba, cada lote tardaba más. En producción esto significa riesgo de timeouts, caídas del servicio y bloqueos de la base de datos.
 
-Causa: El código cargaba todas las facturas en memoria de una vez, y la paginación usada para mitigarlo obligaba a MySQL a descartar miles de filas en cada lectura (coste creciente con el volumen).
+**Causa:** El código cargaba todas las facturas en memoria de una vez, y la paginación usada para mitigarlo obligaba a MySQL a descartar miles de filas en cada lectura (coste creciente con el volumen).
 
-Solución: Refactoricé el proceso para leer en streaming (memoria constante, sin cargar todo), usar paginación eficiente (el mismo lote tarda lo mismo sea el número 1 o el número 200) y actualizar en bloque en vez de fila por fila (100.000 queries → ~200).
+**Solución:** Refactoricé el proceso para leer en streaming (memoria constante, sin cargar todo), usar paginación eficiente (el mismo lote tarda lo mismo sea el número 1 o el número 200) y actualizar en bloque en vez de fila por fila (100.000 queries → ~200).
 
-Resultado medido:
+**Resultado medido:**
 
-100.000 facturas en 10,4 segundos (15,5 s en Docker)
-Pico de memoria: 6-25 MB, plano sin importar el volumen → escala lineal a 1M de facturas
-Verificado con perfiles de MySQL, no estimaciones.
+1. 100.000 facturas en 10,4 segundos (15,5 s en Docker)
+2. Pico de memoria: 6-25 MB, plano sin importar el volumen → escala lineal a 1M de facturas
+3. Verificado con perfiles de MySQL, no estimaciones.
 
 **Técnico**
 
@@ -308,17 +308,17 @@ Verificado con perfiles de MySQL, no estimaciones.
 
 ### 2. Python & Event Loop: ¿qué ocurre si ejecuto cálculos pesados o una librería síncrona dentro de un `async def` y cómo lo evito?
 
-Problema: En un sistema asíncrono, un solo cálculo pesado o una llamada bloqueante puede congelar el servicio completo: todas las peticiones se quedan en cola a la vez, la latencia se dispara, fallan los health checks y Kubernetes puede reiniciar los pods.
+**Problema:** En un sistema asíncrono, un solo cálculo pesado o una llamada bloqueante puede congelar el servicio completo: todas las peticiones se quedan en cola a la vez, la latencia se dispara, fallan los health checks y Kubernetes puede reiniciar los pods.
 
-Riesgo típico: Usar una librería síncrona (muy común: clientes HTTP o de base de datos síncronos) dentro de código asíncrono. El bug no se ve en pruebas con poco tráfico; aparece en producción bajo carga.
+**Riesgo típico:** Usar una librería síncrona (muy común: clientes HTTP o de base de datos síncronos) dentro de código asíncrono. El bug no se ve en pruebas con poco tráfico; aparece en producción bajo carga.
 
 Cómo lo mitigamos (por diseño, no por remedio posterior):
 
-El endpoint público hace lo mínimo: valida y encola. El trabajo pesado vive en workers separados, con concurrencia acotada — un pico de validaciones no afecta a la API.
+**El endpoint público hace lo mínimo:** valida y encola. El trabajo pesado vive en workers separados, con concurrencia acotada — un pico de validaciones no afecta a la API.
 Todos los clientes externos (proveedor, Redis) son asíncronos.
 Operaciones bloqueantes se ejecutan fuera del hilo principal.
 Timeouts, reintentos limitados y corte automático si el proveedor falla (circuit breaker), para que una dependencia caída no arrastre al servicio.
-Impacto: Previsibilidad bajo carga y aislamiento de fallos — el endpoint responde rápido aunque los workers estén saturados o el proveedor externo esté lento.
+**Impacto:** Previsibilidad bajo carga y aislamiento de fallos — el endpoint responde rápido aunque los workers estén saturados o el proveedor externo esté lento.
 
 **Técnico**
 
@@ -334,22 +334,22 @@ El event loop de asyncio corre en **un solo hilo**. Una corrutina solo cede el c
 
 ### 3. Resiliencia en producción: si Redis se llena o se cae durante un pico, ¿cómo evito perder lo que los clientes están enviando?
 
-Problema: En picos de tráfico, un componente intermedio (Redis) puede llenarse o caerse. El riesgo silencioso es perder mensajes de clientes sin que nadie lo note: el sistema responde "recibido" pero el mensaje se evapora.
+**Problema:** En picos de tráfico, un componente intermedio (Redis) puede llenarse o caerse. El riesgo silencioso es perder mensajes de clientes sin que nadie lo note: el sistema responde "recibido" pero el mensaje se evapora.
 
-Decisión de diseño clave: Nunca respondemos "aceptado" si el dato aún no está a salvo en disco. Si Redis falla o está lleno, la escritura falla de forma visible y activamos una contingencia, en vez de dejar que el sistema descarte mensajes silenciosamente.
+**Decisión de diseño clave:** Nunca respondemos "aceptado" si el dato aún no está a salvo en disco. Si Redis falla o está lleno, la escritura falla de forma visible y activamos una contingencia, en vez de dejar que el sistema descarte mensajes silenciosamente.
 
-Contingencia: Los datos se escriben en un archivo local persistente y se reintroducen automáticamente en la cola cuando Redis se recupera. Si fallara también el disco, devolvemos un error claro al cliente para que reintente, en lugar de una confirmación falsa.
+**Contingencia:** Los datos se escriben en un archivo local persistente y se reintroducen automáticamente en la cola cuando Redis se recupera. Si fallara también el disco, devolvemos un error claro al cliente para que reintente, en lugar de una confirmación falsa.
 
-Garantías que esto aporta:
+**Garantías que esto aporta:**
 
 Cero pérdida de mensajes, verificado con pruebas de caos: llenar Redis, provocar failovers, llenar el disco — y comprobar que todo lo aceptado termina validado o en cola de reintentos.
 Sin duplicados aunque haya reintentos, mediante idempotencia.
 
-Visibilidad: alertas de backlog y presión sobre el sistema, con mecanismos de control de carga si el volumen crece.
+**Visibilidad:** alertas de backlog y presión sobre el sistema, con mecanismos de control de carga si el volumen crece.
 
-Evidencia real: Con Redis detenido, se aceptaron 20 documentos (~20 ms por petición); al reiniciar Redis, el sistema los reenvió automáticamente y se procesaron 20/20 sin pérdida.
+**Evidencia real:** Con Redis detenido, se aceptaron 20 documentos (~20 ms por petición); al reiniciar Redis, el sistema los reenvió automáticamente y se procesaron 20/20 sin pérdida.
 
-En AWS: el buffer durable pasaría a SQS/Kinesis (con 14 días de retención) y el spool a S3, dejando Redis solo como acelerador, nunca como almacenamiento de registro.
+**En AWS:** el buffer durable pasaría a SQS/Kinesis (con 14 días de retención) y el spool a S3, dejando Redis solo como acelerador, nunca como almacenamiento de registro.
 
 **Tëcnico**
 
@@ -379,19 +379,19 @@ no es viable en producción de alto volumen. Lo implementé como modo opcional p
 
 Por qué falla, en términos de impacto:
 
-Bloquea a los demás: durante toda la ejecución (decenas de segundos), miles de filas quedan bloqueadas para cualquier otro proceso. Medido: 50.000+ filas bloqueadas con transacción única vs. ~500 con lotes. Cualquier operación concurrente del negocio se queda esperando o falla.
+**Bloquea a los demás:** durante toda la ejecución (decenas de segundos), miles de filas quedan bloqueadas para cualquier otro proceso. Medido: 50.000+ filas bloqueadas con transacción única vs. ~500 con lotes. Cualquier operación concurrente del negocio se queda esperando o falla.
 
-Sin punto de control: si algo falla en la fila 99.999 — un registro inválido, un timeout, un reinicio del worker — se pierde todo el trabajo y hay que empezar de cero. Con lotes, el fallo afecta solo a 500 filas y se reanuda desde el último punto.
+**Sin punto de control:** si algo falla en la fila 99.999 — un registro inválido, un timeout, un reinicio del worker — se pierde todo el trabajo y hay que empezar de cero. Con lotes, el fallo afecta solo a 500 filas y se reanuda desde el último punto.
 
-Sobrecarga de la base de datos: una transacción gigante genera problemas de replicación, recuperación lenta tras un crash y presión de memoria en MySQL.
+**Sobrecarga de la base de datos:** una transacción gigante genera problemas de replicación, recuperación lenta tras un crash y presión de memoria en MySQL.
 
 No es operable: no se puede pausar, reanudar ni paralelizar.
 
-Es más lento además: medido, 15,3 s vs. 10,4 s (~47% más), así que ni siquiera gana en velocidad.
+**Es más lento además:** medido, 15,3 s vs. 10,4 s (~47% más), así que ni siquiera gana en velocidad.
 
-El diseño que sí uso: transacciones cortas por lote de 500 filas, reanudable desde checkpoints, idempotente (segura ante reintentos), y eventos por lote. Como siguiente paso, el patrón Outbox para garantizar que ningún evento se pierda ni se dispare de forma fantasma.
+**El diseño que sí uso:** transacciones cortas por lote de 500 filas, reanudable desde checkpoints, idempotente (segura ante reintentos), y eventos por lote. Como siguiente paso, el patrón Outbox para garantizar que ningún evento se pierda ni se dispare de forma fantasma.
 
-Cuándo sí sería aceptable: lotes pequeños, en ventana de mantenimiento y sin escritores concurrentes. Para 100k facturas en producción.
+**Cuándo sí sería aceptable:** lotes pequeños, en ventana de mantenimiento y sin escritores concurrentes. Para 100k facturas en producción.
 
 **Técnico**
 
