@@ -274,6 +274,20 @@ flowchart TB
 
 ### 1. Laravel & PDO: ¿por qué `Invoice::all()->each(...)` o `chunk()` agotan la memoria o ralentizan MySQL, y cómo lo solucioné?
 
+Problema: El procesamiento masivo de facturas (100.000 registros) consumía cientos de MB de memoria y se degradaba progresivamente: a medida que avanzaba, cada lote tardaba más. En producción esto significa riesgo de timeouts, caídas del servicio y bloqueos de la base de datos.
+
+Causa: El código cargaba todas las facturas en memoria de una vez, y la paginación usada para mitigarlo obligaba a MySQL a descartar miles de filas en cada lectura (coste creciente con el volumen).
+
+Solución: Refactoricé el proceso para leer en streaming (memoria constante, sin cargar todo), usar paginación eficiente (el mismo lote tarda lo mismo sea el número 1 o el número 200) y actualizar en bloque en vez de fila por fila (100.000 queries → ~200).
+
+Resultado medido:
+
+100.000 facturas en 10,4 segundos (15,5 s en Docker)
+Pico de memoria: 6-25 MB, plano sin importar el volumen → escala lineal a 1M de facturas
+Verificado con perfiles de MySQL, no estimaciones.
+
+**Técnico**
+
 **`Invoice::all()->each(...)`** ejecuta un `SELECT *` sin límite y construye la colección completa **antes** de iterar: 100.000 modelos Eloquent vivos a la vez (atributos, `$original`, `$changes`, casts, eventos), cientos de MB. Además, PDO usa consultas *buffered* por defecto, por lo que el result set completo también se materializa en el cliente.
 
 **`chunk()`** acota los modelos por iteración, pero:
@@ -281,7 +295,7 @@ flowchart TB
 1. **Usa `OFFSET`**: la página 200 ejecuta `LIMIT 99500, 500`; MySQL debe leer y descartar 99.500 filas para devolver 500. El coste por página crece y el total es cuadrático. Medido con `ANALYZE FORMAT=JSON`: keyset lee **501 filas**, `OFFSET 99500` lee **100.000** para la misma página.
 2. **Hidrata modelos y dispara eventos por fila** (`retrieved`, `saving`, `saved`), y si se hace `save()` por fila son 100.000 UPDATE. `chunkById()` corrige el OFFSET, pero sigue hidratando modelos y escribiendo fila a fila.
 
-**Solución exacta:**
+**Solución:**
 
 - `StreamingPdo` con `PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => false`, `ATTR_EMULATE_PREPARES => false` y `LIMIT 501`.
 - Keyset pagination (`status = 'pending' AND id > :lastId ORDER BY id`) sobre el índice `(status, id)`.
@@ -294,6 +308,20 @@ flowchart TB
 
 ### 2. Python & Event Loop: ¿qué ocurre si ejecuto cálculos pesados o una librería síncrona dentro de un `async def` y cómo lo evito?
 
+Problema: En un sistema asíncrono, un solo cálculo pesado o una llamada bloqueante puede congelar el servicio completo: todas las peticiones se quedan en cola a la vez, la latencia se dispara, fallan los health checks y Kubernetes puede reiniciar los pods.
+
+Riesgo típico: Usar una librería síncrona (muy común: clientes HTTP o de base de datos síncronos) dentro de código asíncrono. El bug no se ve en pruebas con poco tráfico; aparece en producción bajo carga.
+
+Cómo lo mitigamos (por diseño, no por remedio posterior):
+
+El endpoint público hace lo mínimo: valida y encola. El trabajo pesado vive en workers separados, con concurrencia acotada — un pico de validaciones no afecta a la API.
+Todos los clientes externos (proveedor, Redis) son asíncronos.
+Operaciones bloqueantes se ejecutan fuera del hilo principal.
+Timeouts, reintentos limitados y corte automático si el proveedor falla (circuit breaker), para que una dependencia caída no arrastre al servicio.
+Impacto: Previsibilidad bajo carga y aislamiento de fallos — el endpoint responde rápido aunque los workers estén saturados o el proveedor externo esté lento.
+
+**Técnico**
+
 El event loop de asyncio corre en **un solo hilo**. Una corrutina solo cede el control en un `await` que realmente suspenda. Si dentro de un `async def` se ejecuta una librería bloqueante (`requests`, `time.sleep`, un driver de DB síncrono, `boto3`) o cálculo pesado en Python puro, el hilo queda ocupado y **ninguna otra corrutina avanza**: se serializan las requests, suben las latencias, fallan los health checks y se acumulan timeouts. El GIL hace que usar threads no ayude en cargas CPU-bound.
 
 **Cómo lo evito:**
@@ -305,6 +333,25 @@ El event loop de asyncio corre en **un solo hilo**. Una corrutina solo cede el c
 5. **Timeouts y backpressure:** 150 ms de publicación, 2 s de timeout del proveedor, reintentos acotados y circuit breaker.
 
 ### 3. Resiliencia en producción: si Redis se llena o se cae durante un pico, ¿cómo evito perder lo que los clientes están enviando?
+
+Problema: En picos de tráfico, un componente intermedio (Redis) puede llenarse o caerse. El riesgo silencioso es perder mensajes de clientes sin que nadie lo note: el sistema responde "recibido" pero el mensaje se evapora.
+
+Decisión de diseño clave: Nunca respondemos "aceptado" si el dato aún no está a salvo en disco. Si Redis falla o está lleno, la escritura falla de forma visible y activamos una contingencia, en vez de dejar que el sistema descarte mensajes silenciosamente.
+
+Contingencia: Los datos se escriben en un archivo local persistente y se reintroducen automáticamente en la cola cuando Redis se recupera. Si fallara también el disco, devolvemos un error claro al cliente para que reintente, en lugar de una confirmación falsa.
+
+Garantías que esto aporta:
+
+Cero pérdida de mensajes, verificado con pruebas de caos: llenar Redis, provocar failovers, llenar el disco — y comprobar que todo lo aceptado termina validado o en cola de reintentos.
+Sin duplicados aunque haya reintentos, mediante idempotencia.
+
+Visibilidad: alertas de backlog y presión sobre el sistema, con mecanismos de control de carga si el volumen crece.
+
+Evidencia real: Con Redis detenido, se aceptaron 20 documentos (~20 ms por petición); al reiniciar Redis, el sistema los reenvió automáticamente y se procesaron 20/20 sin pérdida.
+
+En AWS: el buffer durable pasaría a SQS/Kinesis (con 14 días de retención) y el spool a S3, dejando Redis solo como acelerador, nunca como almacenamiento de registro.
+
+**Tëcnico**
 
 **Configuración:** Redis corre con `maxmemory-policy noeviction` y AOF. Con `allkeys-lru`, un pico podría **evacuar mensajes de la cola silenciosamente**; prefiero que la escritura falle y activar la contingencia.
 
@@ -328,6 +375,26 @@ Además:
 
 ### 4. Criterio de arquitectura (análisis crítico): ¿es viable procesar 100k registros en una única `DB::transaction` y disparar un evento Eloquent por registro?
 
+no es viable en producción de alto volumen. Lo implementé como modo opcional para medirlo con datos reales, pero el diseño por defecto es por lotes.
+
+Por qué falla, en términos de impacto:
+
+Bloquea a los demás: durante toda la ejecución (decenas de segundos), miles de filas quedan bloqueadas para cualquier otro proceso. Medido: 50.000+ filas bloqueadas con transacción única vs. ~500 con lotes. Cualquier operación concurrente del negocio se queda esperando o falla.
+
+Sin punto de control: si algo falla en la fila 99.999 — un registro inválido, un timeout, un reinicio del worker — se pierde todo el trabajo y hay que empezar de cero. Con lotes, el fallo afecta solo a 500 filas y se reanuda desde el último punto.
+
+Sobrecarga de la base de datos: una transacción gigante genera problemas de replicación, recuperación lenta tras un crash y presión de memoria en MySQL.
+
+No es operable: no se puede pausar, reanudar ni paralelizar.
+
+Es más lento además: medido, 15,3 s vs. 10,4 s (~47% más), así que ni siquiera gana en velocidad.
+
+El diseño que sí uso: transacciones cortas por lote de 500 filas, reanudable desde checkpoints, idempotente (segura ante reintentos), y eventos por lote. Como siguiente paso, el patrón Outbox para garantizar que ningún evento se pierda ni se dispare de forma fantasma.
+
+Cuándo sí sería aceptable: lotes pequeños, en ventana de mantenimiento y sin escritores concurrentes. Para 100k facturas en producción.
+
+**Técnico**
+
 **No es viable en producción de alto volumen.** Lo implementé como modo opcional (`--transaction=single`, `--events=per_invoice`) para medirlo, pero el valor por defecto es `chunked` + evento por lote.
 
 **Riesgos técnicos:**
@@ -347,7 +414,7 @@ Además:
 - Evento de dominio por lote; `per_invoice` solo si el negocio lo exige.
 - **Outbox pattern** como siguiente paso: evento en la misma transacción de la página y relay asíncrono, garantizando *at-least-once* sin eventos fantasma.
 
-**Cuándo sí sería aceptable:** lotes pequeños (unidades de miles), ventana de mantenimiento sin escritores concurrentes y sin eventos por fila. Para 100k facturas en producción, no.
+**Cuándo sí sería aceptable:** lotes pequeños (unidades de miles), ventana de mantenimiento sin escritores concurrentes y sin eventos por fila. Para 100k facturas en producción.
 
 
 
